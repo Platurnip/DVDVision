@@ -7,7 +7,7 @@ An upgraded Pong game where the players are able to reminisce on the past. This 
 
 Play the game here:
 
-https://platurnip.github.io/DVDVision/
+https://platurnip.github.io/DVDVision/DVDVision/index.html
 
 ---
 
