@@ -1,0 +1,640 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DVD Pong + Ghost Obstacles + Red X Cursor + Random Textures</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      font-family: sans-serif;
+    }
+    canvas { border: 1px solid #444; }
+
+    #score {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: monospace;
+      font-size: 26px;
+      color: #ffffff;
+      z-index: 5;
+    }
+
+    #powerup {
+      position: fixed;
+      top: 55px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: monospace;
+      font-size: 20px;
+      color: #000;
+      background: rgba(255,255,0,0.75);
+      padding: 10px 15px;
+      border-radius: 10px;
+      opacity: 0;
+      transition: opacity 0.5s ease;
+      pointer-events: none;
+      white-space: nowrap;
+      z-index: 5;
+    }
+
+    #help {
+      position: fixed;
+      top: 110px;
+      left: 20px;
+      width: 320px;
+      font-size: 15px;
+      color: #ffffff;
+      background: rgba(0,0,0,0.65);
+      padding: 10px 15px;
+      text-align: left;
+      line-height: 1.5;
+      z-index: 5;
+    }
+
+    #paneHost {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      z-index: 9999;
+    }
+
+    #paneError {
+      color: #fff;
+      background: rgba(255,0,0,0.65);
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-family: monospace;
+      font-size: 13px;
+      max-width: 260px;
+      line-height: 1.35;
+    }
+  </style>
+
+  <script src="https://cdn.jsdelivr.net/npm/tweakpane@3.1.7/dist/tweakpane.min.js"></script>
+</head>
+<body>
+  <div id="score">0 : 0</div>
+  <div id="powerup">POWER UP!</div>
+
+  <div id="help">
+    <b>Paddles</b><br>
+    P1: Tab (up), CapsLock (down)<br>
+    P2: ↑ (up), ↓ (down)<br><br>
+
+    <b>Obstacle Cursor (Red X)</b><br>
+    P1: WASD to move cursor<br>
+    P2: IJKL to move cursor<br><br>
+
+    <b>Place Obstacle</b><br>
+    P1: E to place (max 4)<br>
+    P2: Enter to place (max 4)<br><br>
+
+    <b>Power-up</b><br>
+    If the DVD hits a screen corner:<br>
+    Left corner → clears P1 obstacles (P2 power-up)<br>
+    Right corner → clears P2 obstacles (P1 power-up)
+  </div>
+
+  <div id="paneHost"></div>
+  <canvas id="glcanvas" width="1800" height="1100"></canvas>
+
+<script>
+const UI = {
+  dvdSpeed: 0.018,
+  dvdSize: 1.0,
+  obstacleSize: 1.0,
+  paddleSize: 1.0,
+  cornerSize: 0.015,
+  playfieldSize: 1.0   
+};
+
+let worldHalfX = 1.0;
+let worldHalfY = 1.0;
+
+(function setupPane() {
+  const host = document.getElementById("paneHost");
+  if (!window.Tweakpane || !window.Tweakpane.Pane) {
+    const div = document.createElement("div");
+    div.id = "paneError";
+    div.textContent = "Tweakpane did NOT load. Check DevTools Console.";
+    host.appendChild(div);
+    return;
+  }
+
+  const pane = new Tweakpane.Pane({ container: host, title: "Controls" });
+  pane.addInput(UI, "dvdSpeed",     { min: 0.002, max: 0.05, step: 0.001, label: "DVD Speed" });
+  pane.addInput(UI, "dvdSize",      { min: 0.3,   max: 3.0,  step: 0.05,  label: "DVD Size" });
+  pane.addInput(UI, "obstacleSize", { min: 0.3,   max: 3.0,  step: 0.05,  label: "Obstacle Size" });
+  pane.addInput(UI, "paddleSize",   { min: 0.5,   max: 2.5,  step: 0.05,  label: "Paddle Size" });
+  pane.addInput(UI, "cornerSize",   { min: 0.003, max: 0.08, step: 0.001, label: "Corner Size" });
+  pane.addInput(UI, "playfieldSize",{ min: 0.4,   max: 1.0,  step: 0.05,  label: "Playfield Size" });
+})();
+
+const VS = `
+attribute vec2 a_position;
+attribute vec2 a_texcoord;
+uniform mat4 u_matrix;
+varying vec2 v_texcoord;
+void main() {
+  gl_Position = u_matrix * vec4(a_position, 0.0, 1.0);
+  v_texcoord = a_texcoord;
+}
+`;
+
+const FS = `
+precision mediump float;
+uniform vec4 u_color;
+uniform sampler2D u_texture;
+uniform float u_useTexture;
+varying vec2 v_texcoord;
+void main() {
+  vec4 texColor = texture2D(u_texture, v_texcoord);
+  gl_FragColor = mix(u_color, texColor, u_useTexture);
+}
+`;
+
+function createShader(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    console.error(gl.getShaderInfoLog(sh));
+    gl.deleteShader(sh);
+    return null;
+  }
+  return sh;
+}
+
+function createProgram(gl, vsSrc, fsSrc) {
+  const vs = createShader(gl, gl.VERTEX_SHADER, vsSrc);
+  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog, vs);
+  gl.attachShader(prog, fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    console.error(gl.getProgramInfoLog(prog));
+    gl.deleteProgram(prog);
+    return null;
+  }
+  return prog;
+}
+
+function matTranslateScale(tx, ty, sx, sy) {
+  return new Float32Array([
+    sx, 0.0, 0.0, 0.0,
+    0.0, sy, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    tx, ty, 0.0, 1.0
+  ]);
+}
+
+function loadTexture(gl, url) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0,
+    gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 0, 255, 255]));
+
+  const img = new Image();
+  img.onload = () => {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  };
+  img.onerror = () => console.error("FAILED to load image:", url);
+  img.src = url;
+  return tex;
+}
+
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl");
+if (!gl) alert("WebGL not supported");
+
+// Aspect ratio for "square-ish" shapes
+const ASPECT = gl.canvas.width / gl.canvas.height;
+
+const program = createProgram(gl, VS, FS);
+gl.useProgram(program);
+
+const a_position   = gl.getAttribLocation(program, "a_position");
+const a_texcoord   = gl.getAttribLocation(program, "a_texcoord");
+const u_matrix     = gl.getUniformLocation(program, "u_matrix");
+const u_color      = gl.getUniformLocation(program, "u_color");
+const u_texture    = gl.getUniformLocation(program, "u_texture");
+const u_useTexture = gl.getUniformLocation(program, "u_useTexture");
+
+gl.uniform1i(u_texture, 0);
+gl.enable(gl.BLEND);
+gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+const quadPos = new Float32Array([
+  -1.0, -1.0,
+   1.0, -1.0,
+   1.0,  1.0,
+  -1.0,  1.0
+]);
+
+const quadUV = new Float32Array([
+  0.0, 0.0,
+  1.0, 0.0,
+  1.0, 1.0,
+  0.0, 1.0
+]);
+
+const quadIdx = new Uint16Array([0, 1, 2, 0, 2, 3]);
+
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, quadPos, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(a_position);
+gl.vertexAttribPointer(a_position, 2, gl.FLOAT, false, 0, 0);
+
+const tbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, tbo);
+gl.bufferData(gl.ARRAY_BUFFER, quadUV, gl.STATIC_DRAW);
+gl.enableVertexAttribArray(a_texcoord);
+gl.vertexAttribPointer(a_texcoord, 2, gl.FLOAT, false, 0, 0);
+
+const ibo = gl.createBuffer();
+gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ibo);
+gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, quadIdx, gl.STATIC_DRAW);
+
+const TEX = {
+  bg:      loadTexture(gl, "bg.jpg"),
+  dvd:     loadTexture(gl, "dvdlogo.png"),
+  portal1: loadTexture(gl, "portal1.png"),
+  portal2: loadTexture(gl, "portal2.png"),
+  redx:    loadTexture(gl, "redx.png"),
+  obstacles: [
+    loadTexture(gl, "shape1.png"),
+    loadTexture(gl, "shape2.png"),
+    loadTexture(gl, "shape3.png"),
+    loadTexture(gl, "shape4.png"),
+    loadTexture(gl, "shape5.png")
+  ]
+};
+
+function randomObstacleTexture() {
+  return TEX.obstacles[(Math.random() * TEX.obstacles.length) | 0];
+}
+
+function rect(x, y, hw, hh, vx, vy, color, texture) {
+  return {
+    x, y,
+    halfWidth: hw,
+    halfHeight: hh,
+    vx, vy,
+    color,
+    useTexture: texture ? 1.0 : 0.0,
+    texture: texture || null
+  };
+}
+
+function draw(obj) {
+  gl.uniformMatrix4fv(u_matrix, false, matTranslateScale(obj.x, obj.y, obj.halfWidth, obj.halfHeight));
+  gl.uniform4fv(u_color, obj.color);
+  gl.uniform1f(u_useTexture, obj.useTexture);
+  if (obj.useTexture && obj.texture) gl.bindTexture(gl.TEXTURE_2D, obj.texture);
+  gl.drawElements(gl.TRIANGLES, 6, gl.UNSIGNED_SHORT, 0);
+}
+
+function overlap(a, b) {
+  return (Math.abs(a.x - b.x) <= a.halfWidth + b.halfWidth) &&
+         (Math.abs(a.y - b.y) <= a.halfHeight + b.halfHeight);
+}
+
+function bounceBallOff(ballObj, r) {
+  const dx = ballObj.x - r.x;
+  const dy = ballObj.y - r.y;
+  const ox = (ballObj.halfWidth + r.halfWidth) - Math.abs(dx);
+  const oy = (ballObj.halfHeight + r.halfHeight) - Math.abs(dy);
+  if (ox <= 0.0 || oy <= 0.0) return false;
+
+  if (ox < oy) {
+    ballObj.x += (dx > 0.0 ? ox : -ox);
+    ballObj.vx *= -1.0;
+  } else {
+    ballObj.y += (dy > 0.0 ? oy : -oy);
+    ballObj.vy *= -1.0;
+  }
+  return true;
+}
+
+const background = rect(0.0, 0.0, 1.0, 1.0, 0.0, 0.0, new Float32Array([1,1,1,1]), TEX.bg);
+
+const BASE_paddleHalfW = 0.05;
+const BASE_paddleHalfH = 0.20;
+const paddleSpeed = 0.015;
+
+const leftPaddle  = rect(-0.90, 0.0, BASE_paddleHalfW, BASE_paddleHalfH, 0.0, 0.0, new Float32Array([1,1,1,1]), TEX.portal1);
+const rightPaddle = rect( 0.90, 0.0, BASE_paddleHalfW, BASE_paddleHalfH, 0.0, 0.0, new Float32Array([1,1,1,1]), TEX.portal2);
+
+const BASE_ballHalfW = 0.10;
+const BASE_ballHalfH = 0.05;
+const ball = rect(0.0, 0.0, BASE_ballHalfW, BASE_ballHalfH, 0.015, 0.010, new Float32Array([1,1,1,1]), TEX.dvd);
+
+// Obstacles "square-ish" using aspect
+const BASE_obstacleHalfW = 0.05;
+const BASE_obstacleHalfH = BASE_obstacleHalfW * ASPECT;
+
+const maxObstaclesPerPlayer = 4;
+let obstaclesP1 = [];
+let obstaclesP2 = [];
+
+let ghostP1X = -0.50, ghostP1Y = 0.00;
+let ghostP2X =  0.50, ghostP2Y = 0.00;
+
+const midDots = [];
+for (let y = -0.95; y <= 0.95; y += 0.10) {
+  midDots.push(rect(0.0, y, 0.005, 0.05, 0.0, 0.0, new Float32Array([0.80,0.80,0.80,1.0]), null));
+}
+
+let leftScore = 0;
+let rightScore = 0;
+const scoreElem = document.getElementById("score");
+function updateScore() { scoreElem.textContent = `${leftScore} : ${rightScore}`; }
+
+const powerElem = document.getElementById("powerup");
+let powerHideTimer = null;
+function showPowerupMessage(text) {
+  powerElem.textContent = text;
+  powerElem.style.opacity = "1";
+  clearTimeout(powerHideTimer);
+  powerHideTimer = setTimeout(() => powerElem.style.opacity = "0", 2500);
+}
+
+const input = {
+  p1Up:false, p1Down:false,
+  p2Up:false, p2Down:false,
+  g1Up:false, g1Down:false, g1Left:false, g1Right:false,
+  g2Up:false, g2Down:false, g2Left:false, g2Right:false
+};
+
+function k(e) { return String(e.key).toLowerCase(); }
+
+function placeObstacle(isP1) {
+  const arr = isP1 ? obstaclesP1 : obstaclesP2;
+  if (arr.length >= maxObstaclesPerPlayer) return;
+
+  const s = UI.obstacleSize;
+  arr.push(rect(
+    isP1 ? ghostP1X : ghostP2X,
+    isP1 ? ghostP1Y : ghostP2Y,
+    BASE_obstacleHalfW * s,
+    BASE_obstacleHalfH * s,
+    0.0, 0.0,
+    new Float32Array([1,1,1,1]),
+    randomObstacleTexture()
+  ));
+}
+
+window.addEventListener("keydown", (e) => {
+  if (e.key === "Tab") e.preventDefault();
+  const key = k(e);
+
+  if (key === "tab")        input.p1Up = true;
+  if (key === "capslock")   input.p1Down = true;
+  if (key === "arrowup")    input.p2Up = true;
+  if (key === "arrowdown")  input.p2Down = true;
+
+  if (key === "w") input.g1Up = true;
+  if (key === "s") input.g1Down = true;
+  if (key === "a") input.g1Left = true;
+  if (key === "d") input.g1Right = true;
+
+  if (key === "i") input.g2Up = true;
+  if (key === "k") input.g2Down = true;
+  if (key === "j") input.g2Left = true;
+  if (key === "l") input.g2Right = true;
+
+  if (key === "e")     placeObstacle(true);
+  if (key === "enter") placeObstacle(false);
+});
+
+window.addEventListener("keyup", (e) => {
+  const key = k(e);
+
+  if (key === "tab")        input.p1Up = false;
+  if (key === "capslock")   input.p1Down = false;
+  if (key === "arrowup")    input.p2Up = false;
+  if (key === "arrowdown")  input.p2Down = false;
+
+  if (key === "w") input.g1Up = false;
+  if (key === "s") input.g1Down = false;
+  if (key === "a") input.g1Left = false;
+  if (key === "d") input.g1Right = false;
+
+  if (key === "i") input.g2Up = false;
+  if (key === "k") input.g2Down = false;
+  if (key === "j") input.g2Left = false;
+  if (key === "l") input.g2Right = false;
+});
+
+function clampY(y, hh) {
+  const top =  worldHalfY - hh;
+  const bot = -worldHalfY + hh;
+  return Math.max(bot, Math.min(top, y));
+}
+
+function setBallSpeedKeepDirection(speed) {
+  const mag = Math.hypot(ball.vx, ball.vy);
+  if (mag < 1e-6) {
+    ball.vx = speed;
+    ball.vy = speed * 0.6;
+    return;
+  }
+  const nx = ball.vx / mag;
+  const ny = ball.vy / mag;
+  ball.vx = nx * speed;
+  ball.vy = ny * speed;
+}
+
+function resetBall(toRight) {
+  ball.x = 0.0;
+  ball.y = 0.0;
+  const speedX = UI.dvdSpeed;
+  const speedY = (Math.random() * UI.dvdSpeed) - (UI.dvdSpeed * 0.35);
+  ball.vx = toRight ? speedX : -speedX;
+  ball.vy = speedY;
+}
+
+let lastCornerHitTime = 0;
+const cornerCooldownMs = 250;
+
+function checkCornerPowerup() {
+  const now = performance.now();
+  if (now - lastCornerHitTime < cornerCooldownMs) return;
+
+  const eps = UI.cornerSize;
+  const hitsLeft   = (ball.x - ball.halfWidth)  <= (-worldHalfX + eps);
+  const hitsRight  = (ball.x + ball.halfWidth)  >= ( worldHalfX - eps);
+  const hitsTop    = (ball.y + ball.halfHeight) >= ( worldHalfY - eps);
+  const hitsBottom = (ball.y - ball.halfHeight) <= (-worldHalfY + eps);
+
+  if (hitsLeft && (hitsTop || hitsBottom)) {
+    obstaclesP1 = [];
+    lastCornerHitTime = now;
+    showPowerupMessage("POWER UP! (P2 cleared P1 obstacles)");
+  }
+  if (hitsRight && (hitsTop || hitsBottom)) {
+    obstaclesP2 = [];
+    lastCornerHitTime = now;
+    showPowerupMessage("POWER UP! (P1 cleared P2 obstacles)");
+  }
+}
+
+function handleBallWalls() {
+  if (ball.y + ball.halfHeight >= worldHalfY) {
+    ball.y = worldHalfY - ball.halfHeight;
+    ball.vy *= -1.0;
+  } else if (ball.y - ball.halfHeight <= -worldHalfY) {
+    ball.y = -worldHalfY + ball.halfHeight;
+    ball.vy *= -1.0;
+  }
+}
+
+function handleBallPaddle(p) {
+  if (!overlap(ball, p)) return;
+
+  ball.x = (ball.x < p.x)
+    ? (p.x - p.halfWidth - ball.halfWidth)
+    : (p.x + p.halfWidth + ball.halfWidth);
+
+  ball.vx *= -1.0;
+
+  const offset = (ball.y - p.y) / p.halfHeight;
+  ball.vy += offset * (UI.dvdSpeed * 0.35);
+
+  const maxVy = UI.dvdSpeed * 1.1;
+  ball.vy = Math.max(-maxVy, Math.min(maxVy, ball.vy));
+}
+
+function handleBallObstacles(arr) {
+  for (let i = 0; i < arr.length; i++) {
+    if (overlap(ball, arr[i])) {
+      bounceBallOff(ball, arr[i]);
+      arr.splice(i, 1);
+      return;
+    }
+  }
+}
+
+function applySliders() {
+  // 🔹 Update world bounds from slider
+  worldHalfX = UI.playfieldSize;
+  worldHalfY = UI.playfieldSize;
+
+  ball.halfWidth  = BASE_ballHalfW * UI.dvdSize;
+  ball.halfHeight = BASE_ballHalfH * UI.dvdSize;
+
+  const ps = UI.paddleSize;
+  leftPaddle.halfWidth  = BASE_paddleHalfW * ps;
+  leftPaddle.halfHeight = BASE_paddleHalfH * ps;
+  rightPaddle.halfWidth  = BASE_paddleHalfW * ps;
+  rightPaddle.halfHeight = BASE_paddleHalfH * ps;
+
+  const os = UI.obstacleSize;
+  for (const o of obstaclesP1) {
+    o.halfWidth  = BASE_obstacleHalfW * os;
+    o.halfHeight = BASE_obstacleHalfH * os;
+  }
+  for (const o of obstaclesP2) {
+    o.halfWidth  = BASE_obstacleHalfW * os;
+    o.halfHeight = BASE_obstacleHalfH * os;
+  }
+
+  setBallSpeedKeepDirection(UI.dvdSpeed);
+}
+
+function render() {
+  applySliders();
+
+  if (input.p1Up)   leftPaddle.y  += paddleSpeed;
+  if (input.p1Down) leftPaddle.y  -= paddleSpeed;
+  if (input.p2Up)   rightPaddle.y += paddleSpeed;
+  if (input.p2Down) rightPaddle.y -= paddleSpeed;
+
+  leftPaddle.y  = clampY(leftPaddle.y,  leftPaddle.halfHeight);
+  rightPaddle.y = clampY(rightPaddle.y, rightPaddle.halfHeight);
+
+  const ghostSpeed = 0.025;
+
+  if (input.g1Up)    ghostP1Y += ghostSpeed;
+  if (input.g1Down)  ghostP1Y -= ghostSpeed;
+  if (input.g1Left)  ghostP1X -= ghostSpeed;
+  if (input.g1Right) ghostP1X += ghostSpeed;
+
+  if (input.g2Up)    ghostP2Y += ghostSpeed;
+  if (input.g2Down)  ghostP2Y -= ghostSpeed;
+  if (input.g2Left)  ghostP2X -= ghostSpeed;
+  if (input.g2Right) ghostP2X += ghostSpeed;
+
+  const ghostHH = BASE_obstacleHalfH * UI.obstacleSize;
+  // clamp ghosts within their half, respecting playfield size
+  ghostP1X = Math.max(-worldHalfX * 0.85, Math.min(-worldHalfX * 0.05, ghostP1X));
+  ghostP2X = Math.max( worldHalfX * 0.05, Math.min( worldHalfX * 0.85, ghostP2X));
+  ghostP1Y = clampY(ghostP1Y, ghostHH);
+  ghostP2Y = clampY(ghostP2Y, ghostHH);
+
+  ball.x += ball.vx;
+  ball.y += ball.vy;
+
+  handleBallWalls();
+  handleBallPaddle(leftPaddle);
+  handleBallPaddle(rightPaddle);
+  handleBallObstacles(obstaclesP1);
+  handleBallObstacles(obstaclesP2);
+  checkCornerPowerup();
+
+
+  const scoreMargin = 0.05;
+  if (ball.x < -worldHalfX - scoreMargin) {
+    rightScore++;
+    updateScore();
+    resetBall(true);
+  }
+  if (ball.x > worldHalfX + scoreMargin) {
+    leftScore++;
+    updateScore();
+    resetBall(false);
+  }
+
+  gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+  gl.clearColor(1.0, 1.0, 1.0, 1.0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  draw(background);
+  for (const d of midDots) draw(d);
+
+  draw(leftPaddle);
+  draw(rightPaddle);
+
+  for (const o of obstaclesP1) draw(o);
+  for (const o of obstaclesP2) draw(o);
+
+  const xHalfW = 0.03;
+  const xHalfH = xHalfW * ASPECT;
+  draw(rect(ghostP1X, ghostP1Y, xHalfW, xHalfH, 0.0, 0.0, new Float32Array([1,1,1,1]), TEX.redx));
+  draw(rect(ghostP2X, ghostP2Y, xHalfW, xHalfH, 0.0, 0.0, new Float32Array([1,1,1,1]), TEX.redx));
+
+  draw(ball);
+
+  requestAnimationFrame(render);
+}
+
+updateScore();
+render();
+</script>
+</body>
+</html>
